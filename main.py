@@ -10,9 +10,9 @@ from psycopg2.pool import ThreadedConnectionPool
 # =========================
 # CONFIG (PUT IN FILE)
 # =========================
-BOT_TOKEN = "YOUR_BOT_TOKEN"
-ADMIN_IDS = {123456789}  # add more admins like: {111,222,333}
-DATABASE_URL = "YOUR_SUPABASE_DATABASE_URL"  # postgres://... from Supabase
+BOT_TOKEN = "8585926679:AAFT_CWzHMm7YQif0xeaDweYQcbXN6XwMjc"
+ADMIN_IDS = {8537079657}  # add more admins like: {111,222,333}
+DATABASE_URL = "postgresql://postgres.nuxdkcfngtmbdrracmtu:RadheyRadhe@aws-1-ap-southeast-1.pooler.supabase.com:5432/postgres"  # postgres://... from Supabase
 
 TELEGRAM_API = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
