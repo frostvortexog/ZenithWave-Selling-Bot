@@ -7,4 +7,5 @@ RUN apt-get update && apt-get install -y libpq-dev \
 WORKDIR /app
 COPY index.php /app/index.php
 
-CMD ["sh", "-c", "php -S 0.0.0.0:${PORT:-10000} index.php"]
+# ✅ Render requires listening on $PORT
+CMD ["sh", "-c", "php -S 0.0.0.0:${PORT} index.php"]
