@@ -2,7 +2,7 @@ import os
 import re
 import requests
 from datetime import datetime
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, List, Dict, Any
 
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
@@ -49,8 +49,7 @@ def db_fetchall(sql: str, params: tuple = ()) -> List[Dict[str, Any]]:
     try:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(sql, params)
-            rows = cur.fetchall()
-            return rows
+            return cur.fetchall()
     finally:
         pool.putconn(conn)
 
@@ -68,9 +67,6 @@ def db_execute(sql: str, params: tuple = ()) -> None:
         pool.putconn(conn)
 
 def db_transaction(fn):
-    """
-    Run fn(conn, cur) inside a transaction with COMMIT/ROLLBACK.
-    """
     conn = pool.getconn()
     try:
         conn.autocommit = False
@@ -154,7 +150,6 @@ def admin_menu():
 # =========================
 # IN-MEMORY STATES
 # =========================
-# NOTE: In-memory states reset on redeploy. For large scale you can store states in DB/Redis.
 states: Dict[int, Dict[str, Any]] = {}
 
 def set_state(chat_id: int, **kwargs):
@@ -165,11 +160,12 @@ def clear_state(chat_id: int):
         del states[chat_id]
 
 # =========================
-# DB INITIAL USER
+# DB USER
 # =========================
 def ensure_user(telegram_id: int, username: str):
     db_execute(
-        "INSERT INTO users (telegram_id, username) VALUES (%s, %s) ON CONFLICT (telegram_id) DO UPDATE SET username=EXCLUDED.username",
+        "INSERT INTO users (telegram_id, username) VALUES (%s, %s) "
+        "ON CONFLICT (telegram_id) DO UPDATE SET username=EXCLUDED.username",
         (telegram_id, username or "")
     )
 
@@ -223,7 +219,7 @@ async def webhook(request: Request):
     data = await request.json()
 
     # -------------------------
-    # CALLBACKS (ADMIN APPROVE/REJECT, AMAZON SUBMIT)
+    # CALLBACKS
     # -------------------------
     if "callback_query" in data:
         cq = data["callback_query"]
@@ -232,9 +228,8 @@ async def webhook(request: Request):
         msg_chat_id = cq["message"]["chat"]["id"]
         cb_data = cq.get("data", "")
 
-        # Amazon "Submit Gift Card" (user-side)
+        # Amazon "Submit Gift Card"
         if cb_data.startswith("amazon_submit:"):
-            # Only the user who created it should proceed
             uid = int(cb_data.split(":")[1])
             if msg_chat_id != uid:
                 tg_answer_callback(callback_id, "Not for you.")
@@ -245,15 +240,17 @@ async def webhook(request: Request):
                 tg_answer_callback(callback_id, "Expired.")
                 return {"ok": True}
 
-            # Next step: ask gift card amount
             set_state(uid, step="amazon_gift_amount")
             tg_answer_callback(callback_id, "OK")
-            tg_send_message(uid, f"Enter your Amazon Gift Card Amount for {st['diamonds']} Diamonds (numbers only):")
+            tg_send_message(uid, f"Enter your Amazon Gift Card Amount / Code for {st['diamonds']} Diamonds:")
             return {"ok": True}
 
         # Admin Approve / Reject deposit
-        if cb_data.startswith("dep_") and from_id in ADMIN_IDS:
-            # dep_approve:<deposit_id> OR dep_reject:<deposit_id>
+        if cb_data.startswith("dep_"):
+            if from_id not in ADMIN_IDS:
+                tg_answer_callback(callback_id, "Admins only.")
+                return {"ok": True}
+
             try:
                 action, dep_id = cb_data.split(":")
                 dep_id = int(dep_id)
@@ -274,7 +271,6 @@ async def webhook(request: Request):
             diamonds = int(deposit["diamonds"])
 
             if action == "dep_approve":
-                # Transaction: mark approved + add diamonds
                 def _tx(conn, cur):
                     cur.execute("UPDATE deposits SET status='approved' WHERE id=%s AND status='pending'", (dep_id,))
                     if cur.rowcount != 1:
@@ -306,11 +302,6 @@ async def webhook(request: Request):
             tg_answer_callback(callback_id, "Unknown action.")
             return {"ok": True}
 
-        # Non-admin pressing admin buttons
-        if cb_data.startswith("dep_") and from_id not in ADMIN_IDS:
-            tg_answer_callback(callback_id, "Admins only.")
-            return {"ok": True}
-
         tg_answer_callback(callback_id, "")
         return {"ok": True}
 
@@ -338,7 +329,6 @@ async def webhook(request: Request):
         tg_send_message(chat_id, "Main menu:", main_menu())
         return {"ok": True}
 
-    # start/admin
     if text == "/start":
         clear_state(chat_id)
         tg_send_message(chat_id, "Welcome 💎", main_menu())
@@ -349,13 +339,11 @@ async def webhook(request: Request):
         tg_send_message(chat_id, "Admin Panel 👑", admin_menu())
         return {"ok": True}
 
-    # balance
     if text == "💎 Balance":
         bal = get_balance(chat_id)
         tg_send_message(chat_id, f"💎 Your Balance: <b>{bal}</b> Diamonds")
         return {"ok": True}
 
-    # my orders
     if text == "📦 My Orders":
         orders = db_fetchall(
             "SELECT coupon_type, quantity, total_spent, created_at FROM orders WHERE telegram_id=%s ORDER BY id DESC LIMIT 20",
@@ -472,22 +460,14 @@ async def webhook(request: Request):
         tg_send_message(
             chat_id,
             summary,
-            {
-                "inline_keyboard": [
-                    [{"text": "✅ Submit a Gift Card", "callback_data": f"amazon_submit:{chat_id}"}]
-                ]
-            }
+            {"inline_keyboard": [[{"text": "✅ Submit a Gift Card", "callback_data": f"amazon_submit:{chat_id}"}]]}
         )
         return {"ok": True}
 
-    # -------- AMAZON: gift card amount input --------
+    # -------- AMAZON: gift amount/code ANY TEXT (no validation) --------
     if st.get("step") == "amazon_gift_amount":
-        gift_amt = safe_int(text)
-        if gift_amt is None:
-            tg_send_message(chat_id, "❌ Please send gift card amount as a number.")
-            return {"ok": True}
-        # store gift amount separately
-        set_state(chat_id, step="amazon_screenshot", gift_amount=gift_amt)
+        gift_text = (text or "").strip()
+        set_state(chat_id, step="amazon_screenshot", gift_amount=gift_text)
         tg_send_message(chat_id, "📸 Now upload a screenshot of the gift card:")
         return {"ok": True}
 
@@ -510,9 +490,10 @@ async def webhook(request: Request):
         file_id = msg["photo"][-1]["file_id"]
         method = "Amazon Gift Card" if st["step"] == "amazon_screenshot" else "UPI"
         diamonds = int(st.get("diamonds", 0))
-        gift_amount = int(st.get("gift_amount", diamonds))  # for amazon, rupees
 
-        # Insert deposit and get ID
+        # gift_amount can be TEXT now (code or amount)
+        gift_amount = st.get("gift_amount", str(diamonds))
+
         def _tx(conn, cur):
             cur.execute(
                 """
@@ -520,7 +501,7 @@ async def webhook(request: Request):
                 VALUES (%s,%s,%s,%s,%s,'pending')
                 RETURNING id
                 """,
-                (chat_id, method, diamonds, gift_amount, file_id)
+                (chat_id, method, diamonds, str(gift_amount), file_id)
             )
             row = cur.fetchone()
             return int(row["id"])
@@ -535,7 +516,7 @@ async def webhook(request: Request):
             f"🆔 TG ID: <code>{chat_id}</code>\n"
             f"💳 Method: <b>{method}</b>\n"
             f"💎 Diamonds: <b>{diamonds}</b>\n"
-            f"💵 Amount: <b>{gift_amount}</b>\n"
+            f"🧾 Gift Amount/Code: <code>{gift_amount}</code>\n"
             f"📅 Time: <b>{now_str()}</b>\n"
             f"🧾 Deposit ID: <code>{dep_id}</code>"
         )
@@ -580,9 +561,7 @@ async def webhook(request: Request):
             clear_state(chat_id)
             return {"ok": True}
 
-        # Transaction: lock user row + pick coupons safely + deduct + mark used + insert order
         def _buy_tx(conn, cur):
-            # Lock user row
             cur.execute("SELECT diamonds FROM users WHERE telegram_id=%s FOR UPDATE", (chat_id,))
             u = cur.fetchone()
             if not u:
@@ -591,7 +570,6 @@ async def webhook(request: Request):
             if balance < total_cost:
                 return ("NO_BAL", balance)
 
-            # Pick coupons safely (skip locked avoids race)
             cur.execute(
                 """
                 SELECT id, code FROM coupons
@@ -609,17 +587,10 @@ async def webhook(request: Request):
             picked_ids = [p["id"] for p in picked]
             picked_codes = [p["code"] for p in picked]
 
-            # Deduct
             cur.execute("UPDATE users SET diamonds = diamonds - %s WHERE telegram_id=%s", (total_cost, chat_id))
-
-            # Mark coupons used
             cur.execute("UPDATE coupons SET is_used=TRUE WHERE id = ANY(%s)", (picked_ids,))
-
-            # Insert order
-            cur.execute(
-                "INSERT INTO orders (telegram_id, coupon_type, quantity, total_spent) VALUES (%s,%s,%s,%s)",
-                (chat_id, ctype, qty, total_cost)
-            )
+            cur.execute("INSERT INTO orders (telegram_id, coupon_type, quantity, total_spent) VALUES (%s,%s,%s,%s)",
+                        (chat_id, ctype, qty, total_cost))
             return ("OK", picked_codes, balance - total_cost)
 
         result = db_transaction(_buy_tx)
@@ -643,8 +614,7 @@ async def webhook(request: Request):
 
         tg_send_message(
             chat_id,
-            "🎉 <b>Purchase Successful!</b>\n\n"
-            "Here are your coupon codes:\n\n"
+            "🎉 <b>Purchase Successful!</b>\n\nHere are your coupon codes:\n\n"
             + "\n".join([f"<code>{c}</code>" for c in codes])
             + f"\n\n💎 New Balance: <b>{new_balance}</b>",
             main_menu()
@@ -656,7 +626,6 @@ async def webhook(request: Request):
     # ADMIN STATE MACHINE
     # =========================
     if chat_id in ADMIN_IDS:
-        # price type
         if st.get("step") == "admin_price_type":
             if text not in COUPON_TYPES:
                 tg_send_message(chat_id, "❌ Select: 500 / 1k / 2k / 4k")
@@ -676,7 +645,6 @@ async def webhook(request: Request):
             clear_state(chat_id)
             return {"ok": True}
 
-        # get code free
         if st.get("step") == "admin_free_type":
             if text not in COUPON_TYPES:
                 tg_send_message(chat_id, "❌ Select: 500 / 1k / 2k / 4k")
@@ -708,7 +676,6 @@ async def webhook(request: Request):
             clear_state(chat_id)
             return {"ok": True}
 
-        # add coupon
         if st.get("step") == "admin_add_type":
             if text not in COUPON_TYPES:
                 tg_send_message(chat_id, "❌ Select: 500 / 1k / 2k / 4k")
@@ -734,7 +701,6 @@ async def webhook(request: Request):
             clear_state(chat_id)
             return {"ok": True}
 
-        # remove coupon
         if st.get("step") == "admin_remove_type":
             if text not in COUPON_TYPES:
                 tg_send_message(chat_id, "❌ Select: 500 / 1k / 2k / 4k")
@@ -775,7 +741,5 @@ async def webhook(request: Request):
         tg_send_message(chat_id, "❌ I wasn't expecting a screenshot right now. Use 💰 Add Coins first.")
         return {"ok": True}
 
-    # Default
     tg_send_message(chat_id, "Choose an option:", main_menu())
-    return {"ok": True
-}
+    return {"ok": True}
